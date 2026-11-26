@@ -117,6 +117,7 @@ class Episode:
         self.seg_hashes = []                   # 每段当前混音哈希
         self.confirmed_hashes = []             # 每段"曾被确认通过"的哈希集合（持久保留）
         self.version = 0                       # 上传/静音保存时递增，供前端发现外部修改
+        self.episode_id = 0                    # 仅上传/载入新集时递增：供前端识别"换集"
 
     def seg_len(self):
         return self.sample_rate * SEGMENT_SECONDS
@@ -147,6 +148,7 @@ class Episode:
             })
         return {
             "loaded": True,
+            "episode_id": self.episode_id,
             "sample_rate": self.sample_rate,
             "num_samples": self.num_samples,
             "duration": self.num_samples / self.sample_rate,
@@ -176,6 +178,7 @@ def install_episode(track_a, track_b, rate):
         EP.confirmed_hashes = [set() for _ in hashes]
         EP.loaded = True
         EP.version += 1
+        EP.episode_id += 1
         return EP.to_dict(), None
 
 

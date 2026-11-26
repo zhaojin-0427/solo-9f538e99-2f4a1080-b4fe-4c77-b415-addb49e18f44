@@ -257,6 +257,16 @@ st = get_state()
 check("重传后静音清空、全部未通过",
       st["mutes"] == {"A": [], "B": []} and not any(s["passed"] for s in st["segments"]))
 
+print("== 13. episode_id：换集递增，改音不变 ==")
+ep_before = get_state()["episode_id"]
+save_mutes({"A": [[1000, 2000]]})
+check("保存静音不改变 episode_id", get_state()["episode_id"] == ep_before, )
+r = client.post("/api/load_sample")
+check("载入样例改变 episode_id", r.status_code == 200
+      and r.get_json()["episode_id"] > ep_before, r.get_json().get("episode_id"))
+ep_after = get_state()["episode_id"]
+check("样例的 episode_id 已更新", ep_after > ep_before)
+
 print()
 if FAILED:
     print(f"共 {len(FAILED)} 项失败：")

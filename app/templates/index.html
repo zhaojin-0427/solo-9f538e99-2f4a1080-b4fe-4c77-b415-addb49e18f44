@@ -25,6 +25,7 @@
   .hint { color: #57606a; font-size: 12.5px; margin: 8px 0 0; }
   .msg { font-size: 13px; color: #cf222e; }
   .msg.okmsg { color: var(--ok); }
+  .msg.info { color: #57606a; }
   .hidden { display: none; }
   table { border-collapse: collapse; width: 100%; margin-top: 10px; }
   th, td { border-bottom: 1px solid var(--line); padding: 7px 8px; font-size: 13.5px;
@@ -94,13 +95,18 @@
     <section class="card">
       <h2>4. 逐段试听与确认</h2>
       <audio id="player" controls></audio><span id="playingLabel"></span>
+      <div class="row" style="margin-top:8px">
+        <span class="msg" id="swapMsg"></span>
+        <button id="btnSwapRetry" class="ghost small hidden">重试加载新混音</button>
+      </div>
       <table id="segTable">
         <thead>
           <tr><th>段</th><th>时间</th><th>采样区间</th><th>状态</th><th>混音哈希</th><th>操作</th></tr>
         </thead>
         <tbody></tbody>
       </table>
-      <p class="hint">确认时校验"刚试听的混音"与该段当前内容一致；若他处改动了静音导致内容变化，需重新试听。</p>
+      <p class="hint">试听中若他处保存了静音，本段混音一变化就会自动取新 WAV 并沿用当时的进度与播放/暂停状态；
+        新混音未实际播放过不能确认。确认时服务端仍会校验"刚试听的混音"与该段当前内容一致。</p>
     </section>
 
     <section class="card">
@@ -117,18 +123,53 @@
 const $ = s => document.querySelector(s);
 let state = null;
 let lastVersion = null;
+let lastEpisodeId = null;
 let editorDirty = false;
-const listened = {};   // 段号 -> 最近一次试听到的混音哈希
+const playedHashes = {}; // 段号 -> 实际开始播放过的混音哈希（只有这些才能用于确认）
 
 const fmtTime = t => `${Math.floor(t/60)}:${(t%60).toFixed(1).padStart(4,'0')}`;
 const shortHash = h => h ? h.slice(0, 10) : '—';
 
-async function refresh() {
+// ---------------------------------------------------------------------------
+// 审听播放器状态
+//   playerEpisode：当前播放器绑定的剧集（换集后旧请求一律作废）
+//   playerSeg / playerHash：当前正在试听的段号与混音哈希
+//   loadSeq：每次发起取 WAV 递增；只有最新一次的结果可以落地
+//   swapAbort / inflight / failedForHash：自动切换新混音的在途与失败状态
+// ---------------------------------------------------------------------------
+let playerEpisode = null;
+let playerSeg = null;
+let playerHash = null;
+let loadSeq = 0;           // 每次发起取 WAV 递增；只有最新一次的结果可以落地
+let swapAbort = null;      // 在途的自动切换请求
+let inflight = null;       // {seg, hash, seq}
+let auditioning = false;   // 用户点了试听、正在取 WAV：此时不抢着自动切换
+let failedForHash = null;  // 自动切换失败时的目标哈希（等待重试或更新的混音）
+let objectUrl = null;
+let refreshSeq = 0;        // 防止乱序返回的 /api/state 覆盖更新状态
+
+async function pullState() {
+  const seq = ++refreshSeq;
   try {
     const r = await fetch('/api/state', {cache: 'no-store'});
-    state = await r.json();
+    const st = await r.json();
+    if (seq !== refreshSeq) return false;              // 已有更新的状态先到，丢弃本次
+    if (lastEpisodeId !== null && (!st.loaded || st.episode_id !== lastEpisodeId)) {
+      // 换集 / 剧集被清空：播放器上的一切属于旧集，立即解除绑定并作废在途请求
+      teardownPlayer(st.loaded ? '剧集已更换，请重新选择段落试听。' : '剧集已不存在，请重新载入。');
+    }
+    state = st;
+    lastEpisodeId = st.loaded ? st.episode_id : null;
     render();
-  } catch (e) { /* 网络抖动时保留旧画面 */ }
+    return true;
+  } catch (e) {
+    return false;   // 网络抖动时保留旧画面
+  }
+}
+
+async function refresh() {
+  await pullState();
+  maybeSwap();
 }
 
 function render() {
@@ -153,10 +194,13 @@ function render() {
   const tb = document.querySelector('#segTable tbody');
   tb.innerHTML = '';
   for (const seg of state.segments) {
-    const isListened = listened[seg.index] === seg.hash;
+    const isPlayed = playedHashes[seg.index] === seg.hash;
+    const isLoaded = playerSeg === seg.index && playerHash === seg.hash
+                     && playerEpisode === state.episode_id;
     let status, cls;
     if (seg.passed) { status = '✅ 已通过'; cls = 'ok'; }
-    else if (isListened) { status = '🎧 已试听，待确认'; cls = 'warn'; }
+    else if (isPlayed) { status = '🎧 已试听，待确认'; cls = 'warn'; }
+    else if (isLoaded) { status = '⏸ 已载入新混音，播放后可确认'; cls = 'warn'; }
     else { status = '⬜ 未通过'; cls = ''; }
     const tr = document.createElement('tr');
     tr.innerHTML =
@@ -172,7 +216,8 @@ function render() {
     bPlay.onclick = () => audition(seg.index);
     const bOk = document.createElement('button');
     bOk.className = 'small'; bOk.textContent = '✔ 确认通过';
-    bOk.disabled = !(isListened && !seg.passed);
+    // 只有实际开始播放过的版本才能确认；且须是当前显示的混音
+    bOk.disabled = !(isPlayed && !seg.passed);
     bOk.onclick = () => confirmSeg(seg.index);
     ops.append(bPlay, bOk);
     tb.appendChild(tr);
@@ -186,36 +231,226 @@ function render() {
 function setMsg(sel, text, ok) {
   const el = $(sel);
   el.textContent = text;
-  el.classList.toggle('okmsg', !!ok);
+  el.classList.remove('okmsg', 'info');
+  if (ok === true) el.classList.add('okmsg');
+  else if (ok === null) el.classList.add('info');
+}
+
+function setSwapMsg(text, ok) {
+  const el = $('#swapMsg');
+  el.textContent = text || '';
+  el.classList.remove('okmsg', 'info');
+  if (ok === true) el.classList.add('okmsg');
+  else if (ok === null) el.classList.add('info');
+}
+
+// ---------------------------------------------------------------------------
+// 加载与切换
+// ---------------------------------------------------------------------------
+
+function abortInflight() {
+  if (swapAbort) { swapAbort.abort(); swapAbort = null; }
+  inflight = null;
+}
+
+/** 把一段新混音装进播放器；seek/play 为切换那一刻沿用下来的进度与播放状态。 */
+function applySource(i, h, blob, ep, seek, play) {
+  const p = $('#player');
+  const oldUrl = objectUrl;
+  objectUrl = URL.createObjectURL(blob);
+  playerEpisode = ep;
+  playerSeg = i;
+  playerHash = h;
+  p.dataset.pendingSeek = String(seek);
+  p.dataset.pendingPlay = play ? '1' : '0';
+  p.dataset.armed = '0';                     // 新源元数据就绪前，旧源的迟到事件不算数
+  p.src = objectUrl;
+  if (oldUrl) URL.revokeObjectURL(oldUrl);   // 新源已挂上，再释放旧的
+  playingBase = `第 ${i + 1} 段（哈希 ${shortHash(h)}）`;
+  $('#playingLabel').textContent = playingBase +
+    (play ? '（正在播放）' : '（已暂停，进度 ' + fmtTime(seek) + '）');
+}
+
+// 播放器标签：段/哈希 + 实时的播放/暂停与进度
+let playingBase = null;     // null 表示普通文字（如"正在载入…"）
+function setPlainLabel(t) { playingBase = null; $('#playingLabel').textContent = t || ''; }
+function renderPlayerLabel() {
+  if (playingBase === null) return;
+  const p = $('#player');
+  if (!p.getAttribute('src')) { $('#playingLabel').textContent = playingBase; return; }
+  $('#playingLabel').textContent = playingBase + (p.paused
+    ? '（已暂停，进度 ' + fmtTime(p.currentTime) + '）'
+    : '（正在播放）');
+}
+
+function bindPlayerEvents() {
+  const p = $('#player');
+  p.addEventListener('loadedmetadata', () => {
+    const seek = Number(p.dataset.pendingSeek);
+    const play = p.dataset.pendingPlay === '1';
+    delete p.dataset.pendingSeek;
+    delete p.dataset.pendingPlay;
+    if (Number.isFinite(seek) && seek > 0) {
+      const max = Number.isFinite(p.duration) ? Math.max(0, p.duration - 0.02) : seek;
+      try { p.currentTime = Math.min(seek, max); } catch (e) { /* 忽略 */ }
+    }
+    if (play) {
+      p.play().catch(() => {
+        // 自动播放被浏览器拦下：不谎报播放状态，提示用户手动继续
+        setSwapMsg('新混音已载入，但浏览器拦截了自动播放；请点播放器继续。', false);
+      });
+    }
+    p.dataset.armed = '1';
+    renderPlayerLabel();
+  });
+  // 只有真正开始播放的版本才可用于确认（且必须是当前挂载的这一版）
+  p.addEventListener('playing', () => {
+    if (playerSeg !== null && playerHash && p.dataset.armed === '1') {
+      playedHashes[playerSeg] = playerHash;   // 旧源的迟到事件因 armed=0 被忽略
+      if (playerEpisode === lastEpisodeId) render();
+    }
+    renderPlayerLabel();
+  });
+  for (const ev of ['pause', 'seeked', 'emptied']) p.addEventListener(ev, renderPlayerLabel);
+}
+bindPlayerEvents();
+
+function teardownPlayer(msg) {
+  abortInflight();
+  loadSeq++;
+  auditioning = false;
+  failedForHash = null;
+  playerEpisode = null;
+  playerSeg = null;
+  playerHash = null;
+  const p = $('#player');
+  p.removeAttribute('src');
+  p.load();
+  if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = null; }
+  for (const k of Object.keys(playedHashes)) delete playedHashes[k];
+  $('#btnSwapRetry').classList.add('hidden');
+  setPlainLabel(msg || '');
+  if (msg) setSwapMsg(msg, null);
 }
 
 async function audition(i) {
-  const r = await fetch(`/api/segment/${i}.wav`, {cache: 'no-store'});
+  abortInflight();
+  $('#btnSwapRetry').classList.add('hidden');
+  failedForHash = null;
+  setSwapMsg('');
+  auditioning = true;
+  const seq = ++loadSeq;
+  const ep = state ? state.episode_id : null;
+  setPlainLabel(`正在载入第 ${i + 1} 段…`);
+  try {
+    const {h, blob} = await fetchSegment(i, null);
+    if (seq !== loadSeq) return;                    // 已点了别段/换集/被新请求取代
+    if (state && state.loaded && ep !== state.episode_id) return;
+    applySource(i, h, blob, ep, 0, true);           // 用户点试听：从头播放
+    render();
+  } catch (err) {
+    if (err.name === 'AbortError' || seq !== loadSeq) return;
+    setPlainLabel('');
+    alert('试听失败：' + err.message);
+  } finally {
+    if (seq === loadSeq) {          // 未被取消/取代才解除"载入中"
+      auditioning = false;
+      maybeSwap();                  // 载入期间若混音又变了，此刻再追最新版本
+    }
+  }
+}
+
+async function fetchSegment(i, signal) {
+  const r = await fetch(`/api/segment/${i}.wav`, {cache: 'no-store', signal});
   if (!r.ok) {
     const d = await r.json().catch(() => ({}));
-    alert('试听失败：' + (d.error || r.status));
-    return;
+    throw new Error(d.error || ('HTTP ' + r.status));
   }
   const h = r.headers.get('X-Mix-Hash');
   const blob = await r.blob();
-  const player = $('#player');
-  player.src = URL.createObjectURL(blob);
-  player.play().catch(() => {});
-  listened[i] = h;
-  $('#playingLabel').textContent = `正在播放第 ${i + 1} 段（哈希 ${shortHash(h)}）`;
-  render();
+  if (!h) throw new Error('响应缺少混音哈希');
+  return {h, blob};
 }
 
+/** 当前试听段的混音哈希变了才取新 WAV；只追页面已知的最新混音。 */
+function maybeSwap() {
+  if (!state || !state.loaded) return;
+  if (playerSeg === null || playerHash === null) return;
+  if (playerEpisode !== state.episode_id) return;
+  if (auditioning) return;                         // 正在载入用户点的试听
+  const seg = state.segments[playerSeg];
+  if (!seg) return;
+  if (seg.hash === playerHash) {
+    // 已与当前混音一致：清掉可能残留的"失败待重试"提示
+    if (failedForHash !== null) { failedForHash = null; $('#btnSwapRetry').classList.add('hidden'); }
+    return;
+  }
+  if (failedForHash === seg.hash) return;          // 等用户点重试或出现更新的混音
+  if (inflight && inflight.seg === playerSeg && inflight.hash === seg.hash) return;
+  startSwap(playerSeg, seg.hash);
+}
+
+async function startSwap(i, targetHash) {
+  if (swapAbort) swapAbort.abort();
+  const ctrl = new AbortController();
+  swapAbort = ctrl;
+  const seq = ++loadSeq;
+  const ep = state.episode_id;
+  inflight = {seg: i, hash: targetHash, seq};
+  setSwapMsg('检测到本段混音已更新，正在载入新版本…（原音频可继续播放、暂停、拖动）', null);
+  try {
+    const {h, blob} = await fetchSegment(i, ctrl.signal);
+    if (seq !== loadSeq || ep !== state.episode_id || playerSeg !== i) return;   // 过期请求
+    // 落地前再同步一次状态：拿到的必须仍是页面已知的最新混音，
+    // 否则丢弃这次结果、等状态更新后重新追最新（不落到中间版本）
+    await pullState();
+    if (seq !== loadSeq || playerSeg !== i) return;
+    if (!state || !state.loaded || state.episode_id !== ep) return;
+    const cur = state.segments[i];
+    if (!cur || cur.hash !== h) {
+      inflight = null; swapAbort = null;
+      setSwapMsg('页面上的混音又有更新，正在同步最新版本…', null);
+      maybeSwap();
+      return;
+    }
+    swapAbort = null; inflight = null;
+    failedForHash = null;
+    $('#btnSwapRetry').classList.add('hidden');
+    // 沿用"切换那一刻"的进度与播放/暂停状态
+    const p = $('#player');
+    applySource(i, h, blob, ep, p.currentTime || 0, !p.paused);
+    setSwapMsg(`已切到第 ${i + 1} 段的新混音（哈希 ${shortHash(h)}）。`, true);
+    render();
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    if (seq !== loadSeq || ep !== state.episode_id || playerSeg !== i) return;
+    inflight = null; swapAbort = null;
+    // 记录失败的目标版本：若期间混音又更新，轮询发现新哈希后仍会自动再试；
+    // 若仍是同一版本，则等待用户点重试。
+    failedForHash = targetHash;
+    $('#btnSwapRetry').classList.remove('hidden');
+    setSwapMsg('新混音加载失败，已保留原音频可继续试听。' + err.message, false);
+  }
+}
+
+$('#btnSwapRetry').onclick = () => {
+  $('#btnSwapRetry').classList.add('hidden');
+  failedForHash = null;
+  setSwapMsg('正在重新载入…', null);
+  maybeSwap();
+};
+
 async function confirmSeg(i) {
+  const h = playedHashes[i] || '';
   const r = await fetch(`/api/confirm/${i}`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({hash: listened[i] || ''})
+    body: JSON.stringify({hash: h})
   });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) {
     alert(d.error || '确认失败');
-    delete listened[i];
+    delete playedHashes[i];   // 内容已被改动：需重新播放新版本
   }
   await refresh();
 }
@@ -293,8 +528,10 @@ $('#btnUpload').onclick = async () => {
   const d = await r.json().catch(() => ({}));
   if (r.ok) {
     setMsg('#uploadMsg', '上传成功。', true);
-    Object.keys(listened).forEach(k => delete listened[k]);
+    teardownPlayer('');
     editorDirty = false;
+    lastVersion = null;
+    lastEpisodeId = null;
     await refresh();
   } else {
     setMsg('#uploadMsg', '上传失败：' + (d.error || r.status), false);
@@ -306,8 +543,10 @@ $('#btnSample').onclick = async () => {
   const d = await r.json().catch(() => ({}));
   if (r.ok) {
     setMsg('#uploadMsg', '已载入内置样例（27 秒，6 段；第 3 段含限幅演示）。', true);
-    Object.keys(listened).forEach(k => delete listened[k]);
+    teardownPlayer('');
     editorDirty = false;
+    lastVersion = null;
+    lastEpisodeId = null;
     await refresh();
   } else {
     setMsg('#uploadMsg', '载入样例失败：' + (d.error || r.status), false);
